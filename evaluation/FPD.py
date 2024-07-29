@@ -1,14 +1,9 @@
-import os
 import pathlib
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-
 import numpy as np
 import torch
 from scipy.linalg import sqrtm
-from scipy.misc import imread
-from torch.nn.functional import adaptive_avg_pool2d
 from evaluation.pointnet import PointNetCls
-from data.dataset_benchmark import BenchmarkDataset
+from data.NuscenesObjectsDataLoader import NuscenesObjectsDataLoader
 
 try:
     from tqdm import tqdm
@@ -23,8 +18,7 @@ except ImportError:
 
 """
 
-def get_activations(pointclouds, model, batch_size=100, dims=1808,
-                    device=None, verbose=False):
+def get_activations(dataloader, model, dims=1808, device=None, verbose=False):
     """Calculates the activations of the pool_3 layer for all images.
     Params:
     -- pointcloud       : pytorch Tensor of pointclouds.
@@ -45,23 +39,18 @@ def get_activations(pointclouds, model, batch_size=100, dims=1808,
     """
     model.eval()
 
-    n_batches = pointclouds.size(0) // batch_size
-    n_used_imgs = n_batches * batch_size
-
-    pred_arr = np.empty((n_used_imgs, dims))
-
-    pointclouds = pointclouds.transpose(1,2)
-    for i in tqdm(range(n_batches)):
+    pred_arr = []
+    for i, batch in tqdm(enumerate(dataloader)):
         if verbose:
-            print('\rPropagating batch %d/%d' % (i + 1, n_batches),
+            print('\rPropagating batch %d/%d' % (i + 1, len(dataloader)),
                   end='', flush=True)
-        start = i * batch_size
-        end = start + batch_size
 
-        pointcloud_batch = pointclouds[start:end]
+        pointcloud_batch = batch[0]
         
         if device is not None:
             pointcloud_batch = pointcloud_batch.to(device)
+
+        pointcloud_batch = pointcloud_batch.transpose(1,2)
 
         _, _, actv = model(pointcloud_batch)
 
@@ -70,7 +59,7 @@ def get_activations(pointclouds, model, batch_size=100, dims=1808,
         # if pred.shape[2] != 1 or pred.shape[3] != 1:
         #    pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
 
-        pred_arr[start:end] = actv.cpu().data.numpy().reshape(batch_size, -1)
+        pred_arr.append(actv.cpu().data.numpy().reshape(pointcloud_batch.shape[0], -1))
 
     if verbose:
         print(' done')
@@ -132,8 +121,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
             np.trace(sigma2) - 2 * tr_covmean)
 
 
-def calculate_activation_statistics(pointclouds, model, batch_size=100,
-                                    dims=1808, device=None, verbose=False):
+def calculate_activation_statistics(dataloader, model, dims=1808, device=None, verbose=False):
     """Calculation of the statistics used by the FID.
     Params:
     -- pointcloud       : pytorch Tensor of pointclouds.
@@ -151,7 +139,8 @@ def calculate_activation_statistics(pointclouds, model, batch_size=100,
     -- sigma : The covariance matrix of the activations of the pool_3 layer of
                the inception model.
     """
-    act = get_activations(pointclouds, model, batch_size, dims, device, verbose)
+    act = get_activations(dataloader, model, dims, device, verbose)
+    act = np.array(act).squeeze(1)
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
     return mu, sigma
@@ -176,20 +165,23 @@ def save_statistics(real_pointclouds, path, model, batch_size, dims, cuda):
     np.savez(path, m = m, s = s)
     print('save done !!!')
 
-def calculate_fpd(pointclouds1, pointclouds2=None, batch_size=100, dims=1808, device=None):
+def calculate_fpd(gen_dl, real_dl, dims=1808, device=None):
     """Calculates the FPD of two pointclouds"""
 
     PointNet_path = './evaluation/cls_model_39.pth'
-    statistic_save_path = './evaluation/pre_statistics.npz'
+    statistic_save_path = './evaluation/pre_statistics_real.npz'
+    statistic_save_path_gen = './evaluation/pre_statistics_xs_4_1a_cross_pointnet_impcgf_4ch_gen_recreate.npz'
     model = PointNetCls(k=16)
     model.load_state_dict(torch.load(PointNet_path))
     
     if device is not None:
         model.to(device)
 
-    m1, s1 = calculate_activation_statistics(pointclouds1, model, batch_size, dims, device)
-    if pointclouds2 is not None:
-        m2, s2 = calculate_activation_statistics(pointclouds2, model, batch_size, dims, device)
+    m1, s1 = calculate_activation_statistics(gen_dl, model, dims, device)
+    np.savez(statistic_save_path_gen, m = m1, s = s1)
+    if real_dl is not None:
+        m2, s2 = calculate_activation_statistics(real_dl, model, dims, device)
+        np.savez(statistic_save_path, m = m2, s = s2)
     else: # Load saved statistics of real pointclouds.
         f = np.load(statistic_save_path)
         m2, s2 = f['m'][:], f['s'][:]
@@ -199,3 +191,18 @@ def calculate_fpd(pointclouds1, pointclouds2=None, batch_size=100, dims=1808, de
 
     return fid_value
     
+def get_nuscenes_FPD():
+    model_to_test = 'xs_4_1a_cross_pointnet_impcgf_4ch_gen_recreate'
+    print(f'Evaluating: {model_to_test}')
+    root = '/home/ekirby/scania/ekirby/datasets/nuscenes_generated_bikes/' + model_to_test
+    dl_generated = NuscenesObjectsDataLoader(root=root, real_or_generated='generated', split='train', num_points=1024)
+    dl_generated = torch.utils.data.DataLoader(dl_generated, batch_size=1, shuffle=False, pin_memory=True, num_workers=4)
+    dl_real =      NuscenesObjectsDataLoader(root=root, real_or_generated='real', split='train', num_points=1024)
+    dl_real =      torch.utils.data.DataLoader(dl_real, batch_size=1, shuffle=False, pin_memory=True, num_workers=4)
+
+    device = torch.device('cuda:0')
+    fid_value = calculate_fpd(dl_generated, dl_real, device=device)
+    
+    print('Frechet Pointcloud Distance <<< {:.10f} >>>'.format(fid_value))
+    with open(f'{model_to_test}_fpd.txt', 'w') as f:
+        print('Frechet Pointcloud Distance <<< {:.10f} >>>'.format(fid_value), file=f)
